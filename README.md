@@ -85,11 +85,9 @@ install chunks in the notebook are set to `eval=FALSE`. An internet connection i
 | `data/mmc2/mmc2.xlsx` | Supplementary clinical table from the paper |
 | `DEG.RData` | Saved edgeR results — **not committed** (large; `.gitignore`d, regenerated on knit) |
 
-## Credits
+## Author
 
-This analysis originated as a group project (Group 6) at the University of Padova.
-Repository prepared and cleaned for publication by **Andrea Attura**.
-Original contributors: _add names here_.
+**Andrea Attura** — MSc Molecular Biology, University of Padova.
 
 ## Reference
 
