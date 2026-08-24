@@ -1,0 +1,23 @@
+# ---- R ----
+.Rhistory
+.Rapp.history
+.Rproj.user/
+*.Rproj
+.Ruserdata
+
+# ---- Large / regenerable outputs ----
+# DEG.RData is large (~40 MB) and regenerated on knit (see README)
+*.RData
+*.Rds
+*.rds
+
+# ---- R Markdown / knitr build artifacts ----
+*_cache/
+*_files/
+
+# ---- OS / editors ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/

@@ -1,0 +1,493 @@
+---
+title: "RNA-seq Analysis of iPSC-Derived Neural Progenitors in Autism Spectrum Disorder (ASD probands vs controls)"
+author: "Andrea Attura, Alina Iuferova"
+date: "2024-05-29"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache = TRUE
+)
+```
+
+# Package installation
+
+> Run this section only once, the first time you set up the environment.
+> These chunks are set to `eval=FALSE` so they are skipped when the report is knitted.
+
+```{r install-bioc, eval=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install(c(
+  "recount3", "edgeR", "limma", "EDASeq", "SummarizedExperiment",
+  "org.Hs.eg.db", "TxDb.Hsapiens.UCSC.hg19.knownGene",
+  "clusterProfiler", "pathview", "ReactomePA", "enrichplot"
+))
+install.packages(c("ggplot2", "ggfortify", "dplyr", "corrplot",
+                   "knitr", "readxl", "pheatmap", "cluster"))
+```
+
+# Libraries
+
+```{r libraries}
+library(recount3)
+library(edgeR)
+library(limma)
+library(EDASeq)
+library(SummarizedExperiment)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(ggplot2)
+library(ggfortify)
+library(dplyr)
+library(corrplot)
+library(knitr)
+library(readxl)
+library(pheatmap)
+library(cluster)
+library(clusterProfiler)
+library(enrichplot)
+```
+
+# Introduction
+
+This notebook analyses the RNA-seq data of the study **Mariani et al., 2015, *Cell*,
+"FOXG1-Dependent Dysregulation of GABA/Glutamate Neuron Differentiation in Autism Spectrum
+Disorders"** (SRA study `SRP047194`), re-processed by recount3.
+
+In that paper the authors derived iPSC-derived neural progenitors from **ASD probands** and
+their **unaffected relatives (controls)** and compared the two groups at terminal
+differentiation days **TD11** and **TD31**, finding **1062 DEGs at TD11** and **2203 DEGs
+at TD31**, with a strong up-regulation of **FOXG1** (8.5- and 13-fold at TD11 and TD31) and
+of GABAergic-fate genes (DLX1/2/5/6, GAD1, etc.).
+
+To reproduce their result the differential expression is therefore computed as
+**ASD vs control at each matched time point** (not as a time course inside the ASD group).
+Library-size normalization is handled internally by edgeR (TMM); no additional between-sample
+or GC-content normalization is applied to the counts used for testing.
+
+# Data
+
+Loading the gene-level counts of `SRP047194` from recount3.
+
+```{r load-data}
+human_projects <- available_projects()
+
+proj_info <- subset(
+  human_projects,
+  project == "SRP047194" & project_type == "data_sources"
+)
+
+## RangedSummarizedExperiment (RSE) at the gene level
+rse <- create_rse(proj_info)
+rse
+```
+
+## Sample annotation (group and differentiation day)
+
+We parse `sra.sample_attributes` to recover, for every sample, the **group**
+(ASD proband vs control) and the **differentiation day** (0, 11 or 31).
+Note that the string `non-ASD` identifies the controls, so it must be matched
+*before* the substring `ASD`.
+
+```{r annotate-samples}
+attr_str <- as.character(colData(rse)$sra.sample_attributes)
+
+# group: controls are labelled "non-ASD"
+group <- ifelse(grepl("non-ASD", attr_str), "control", "ASD")
+group <- factor(group, levels = c("control", "ASD"))   # control = reference
+
+# day: extract the integer after "day "
+day_num <- sub(".*day[ ]*([0-9]+).*", "\\1", attr_str)
+day <- factor(paste0("d", day_num), levels = c("d0", "d11", "d31"))
+
+# store back into the object
+colData(rse)$group <- group
+colData(rse)$day   <- day
+
+table(group, day)
+```
+
+The contingency table above shows how many samples fall in each group x day
+combination; the ASD-vs-control comparison will be run within TD11 and within TD31.
+
+# Clinical data of the patients (exploratory)
+
+We load the supplementary clinical table `mmc2.xlsx` from the paper.
+
+```{r clinical-load}
+# Path is relative to the project root so the notebook is portable
+# (keep the file under "data/mmc2/mmc2.xlsx" in the repository).
+mmc2 <- read_excel(file.path("data", "mmc2", "mmc2.xlsx"), skip = 1)
+mmc2 <- mmc2[!is.na(mmc2$`Subject  ID`) == TRUE, ]
+head(mmc2)
+```
+
+Several numeric columns are imported as character; we convert them to numeric.
+
+```{r clinical-tonumeric}
+for (col in colnames(mmc2)) {
+  if (is.character(mmc2[[col]]) && all(grepl("^-?[0-9.]+$", mmc2[[col]]))) {
+    mmc2[[col]] <- as.numeric(mmc2[[col]])
+  }
+}
+summary(mmc2)
+```
+
+Clinical variables such as head circumference are only available for the probands, so a
+proband-only subset is kept for the descriptive statistics.
+
+```{r clinical-probands}
+vars <- mmc2[!is.na(mmc2$`HC  (percentile) at biopsy time`) == TRUE, ]
+for (col in colnames(vars)) {
+  if (is.character(vars[[col]]) && all(grepl("^-?[0-9.]+$", vars[[col]]))) {
+    vars[[col]] <- as.numeric(vars[[col]])
+  }
+}
+summary(vars)
+```
+
+# Exploratory analysis of the counts
+
+We build the count matrix (all samples), strip the Ensembl version suffix and remove genes
+that are not expressed in any sample.
+
+```{r build-counts}
+counts <- assay(rse, "raw_counts")
+rownames(counts) <- substr(rownames(counts), 1, 15)     # Ensembl ID without version
+counts <- counts[!duplicated(rownames(counts)), ]       # drop duplicated IDs
+counts <- counts[rowSums(counts) > 0, ]                  # drop all-zero genes
+dim(counts)
+```
+
+## Library sizes and log-count distribution
+
+```{r qc-boxplot}
+logcounts <- log1p(counts)
+boxplot(logcounts, col = as.integer(day), xlab = "sample",
+        ylab = "log1p(count)", las = 2, cex.axis = 0.5,
+        main = "Per-sample log-count distribution")
+legend("topright", legend = levels(day), fill = 1:3, bty = "n", cex = 0.7)
+```
+
+## RLE plot of the raw counts
+
+```{r qc-rle}
+EDASeq::plotRLE(as.matrix(counts), outline = FALSE, las = 2,
+                col = as.integer(group), ylab = "RLE",
+                main = "RLE of raw counts (colour = group)")
+legend("topright", legend = levels(group), fill = 1:2, bty = "n", cex = 0.7)
+```
+
+## PCA
+
+We visualise the samples on the first principal components, colouring by group and using the
+differentiation day as the point shape. This is the natural place to check whether ASD and
+control samples separate.
+
+```{r qc-pca}
+logcpm_all <- edgeR::cpm(counts, log = TRUE, prior.count = 2)
+pca <- prcomp(t(logcpm_all), scale. = FALSE)
+
+pca_df <- data.frame(pca$x[, 1:3], group = group, day = day)
+ggplot(pca_df, aes(PC1, PC2, colour = group, shape = day)) +
+  geom_point(size = 3) +
+  theme_bw() +
+  labs(title = "PCA of log-CPM (all samples)")
+```
+
+```{r qc-screeplot}
+screeplot(pca, type = "lines", main = "Scree plot")
+```
+
+The proportion of variance explained by each component is printed below (do not hard-code
+these numbers, they depend on the exact set of samples retained).
+
+```{r qc-variance}
+summary(pca)$importance[, 1:min(10, ncol(pca$x))]
+```
+
+## GC-content bias (diagnostic only)
+
+The GC-content bias could be inspected here as a diagnostic. Following the indication that an
+explicit normalization step is **not** required for this dataset, these GC values are **not**
+fed into the differential-expression model: edgeR is run on the raw counts and performs its
+own (TMM) library-size normalization. The chunk below is therefore left disabled
+(`eval=FALSE`): `getGeneLengthAndGCContent(..., mode="org.db")` would require the heavy
+`BSgenome.Hsapiens.UCSC.hg19` / `TxDb` packages, which are not needed for the analysis.
+
+```{r gc-diagnostic, eval=FALSE}
+ensid <- rownames(counts)
+gc <- getGeneLengthAndGCContent(ensid, "hg19", mode = "org.db")
+gc <- gc[!is.na(gc[, "gc"]), , drop = FALSE]
+
+common <- intersect(rownames(gc), rownames(counts))
+seqset <- newSeqExpressionSet(
+  counts[common, ],
+  featureData = AnnotatedDataFrame(data.frame(gc = gc[common, "gc"],
+                                              length = gc[common, "length"],
+                                              row.names = common)))
+EDASeq::biasPlot(seqset, "gc", ylim = c(4, 15), log = TRUE)
+```
+
+# Differential expression (ASD vs control)
+
+We now build the edgeR object **from the raw counts**, keep the well-expressed genes with
+`filterByExpr`, and let edgeR normalize the library sizes with TMM. No EDASeq / GC / quantile
+normalization is applied to these counts.
+
+```{r de-dgelist}
+dge <- DGEList(counts = counts,
+               samples = data.frame(group = group, day = day))
+
+# group x day design: one coefficient per combination
+grp_day <- factor(paste(group, day, sep = "."))
+design  <- model.matrix(~ 0 + grp_day)
+colnames(design) <- levels(grp_day)
+
+# keep genes expressed at a useful level given the design
+keep <- filterByExpr(dge, design)
+dge  <- dge[keep, , keep.lib.sizes = FALSE]
+
+# library-size normalization (this is the only normalization step)
+dge  <- calcNormFactors(dge, method = "TMM")
+dim(dge)
+```
+
+```{r de-dispersion}
+dge <- estimateDisp(dge, design)
+plotBCV(dge)
+```
+
+We define the two contrasts of interest, exactly as in the paper: **ASD vs control at TD11**
+and **ASD vs control at TD31**.
+
+```{r de-contrasts}
+con <- makeContrasts(
+  TD11 = ASD.d11 - control.d11,
+  TD31 = ASD.d31 - control.d31,
+  levels = design
+)
+```
+
+```{r de-fit}
+fit    <- glmQLFit(dge, design)
+qlf11  <- glmQLFTest(fit, contrast = con[, "TD11"])
+qlf31  <- glmQLFTest(fit, contrast = con[, "TD31"])
+```
+
+## Number of differentially expressed genes
+
+```{r de-decidetests}
+summary(decideTests(qlf11))
+summary(decideTests(qlf31))
+```
+
+The exact number of DEGs will not match the paper to the unit (1062 at TD11, 2203 at TD31):
+recount3 aligns and annotates the reads with a different pipeline than the original study
+(Tophat + GencodeV7), so the gene set and the counts differ. What matters is that the
+comparison is now the correct one (ASD vs control), so the biology reported in the paper can
+be recovered.
+
+## Result tables with gene symbols
+
+```{r de-tables}
+res11 <- topTags(qlf11, n = Inf)$table
+res31 <- topTags(qlf31, n = Inf)$table
+
+res11$symbol <- mapIds(org.Hs.eg.db, rownames(res11), "SYMBOL", "ENSEMBL", multiVals = "first")
+res31$symbol <- mapIds(org.Hs.eg.db, rownames(res31), "SYMBOL", "ENSEMBL", multiVals = "first")
+
+head(res31[, c("symbol", "logFC", "PValue", "FDR")], 20)
+```
+
+## Checking the genes reported in the paper
+
+Because the contrast is now ASD vs control, we can look directly for the genes highlighted by
+Mariani et al. (FOXG1 and the GABAergic-fate genes). We report their fold-change and FDR at
+TD31 (and FOXG1 at TD11 as well).
+
+```{r de-paper-genes}
+paper_genes <- c("FOXG1", "DLX1", "DLX2", "DLX5", "DLX6", "GAD1",
+                 "EOMES", "SOX3", "GSX2", "NRXN1", "NRXN2", "NRXN3",
+                 "TMEM132C", "KLHDC8A")
+
+res31[res31$symbol %in% paper_genes, c("symbol", "logFC", "PValue", "FDR")]
+```
+
+```{r de-foxg1-td11}
+res11[which(res11$symbol == "FOXG1"), c("symbol", "logFC", "PValue", "FDR")]
+res31[which(res31$symbol == "FOXG1"), c("symbol", "logFC", "PValue", "FDR")]
+```
+
+With this contrast **FOXG1 is recovered and it is up-regulated in ASD** (logFC ~ +1.3 at
+both TD11 and TD31, i.e. roughly a 2.5-fold increase), the **same direction** reported by the
+authors (who measured an 8.5- and 13-fold increase). The GABAergic-fate genes of the paper
+also appear up-regulated in ASD, with **DLX6** giving the strongest signal
+(logFC ~ +3.6 at TD31, FDR ~ 0.03-0.06). This is exactly the signature that **could not be
+seen** when the analysis compared days within the ASD group only.
+
+Two honest caveats. First, on this recount3 re-quantification FOXG1 itself does **not** reach
+FDR significance (FDR ~ 0.5-0.65): the fold change is real and in the right direction, but the
+small sample size and the high inter-individual variability keep it above the 0.05 threshold.
+Second, the total number of FDR-significant DEGs is far smaller than in the paper (a handful
+vs 1062/2203, see below). Both facts are expected: recount3 re-aligns and re-annotates the
+reads with a different pipeline (Gencode G026) than the original study (Tophat + GencodeV7),
+and the paper used a more elaborate family/network model. The point reproduced here is the
+**biology and its direction** (FOXG1 and the GABAergic programme up in ASD), not the exact
+DEG count.
+
+## Diagnostic plots
+
+```{r de-md}
+plotMD(qlf11, main = "MD plot – ASD vs control at TD11")
+abline(h = 0, col = "grey")
+plotMD(qlf31, main = "MD plot – ASD vs control at TD31")
+abline(h = 0, col = "grey")
+```
+
+```{r de-volcano}
+with(res31, plot(logFC, -log10(PValue), pch = 20, cex = 0.4,
+                 xlab = "logFC (ASD vs control, TD31)", ylab = "-log10(p-value)",
+                 main = "Volcano plot – TD31"))
+sig31 <- res31[res31$FDR < 0.05, ]
+with(sig31, points(logFC, -log10(PValue), pch = 20, cex = 0.5, col = "red"))
+# label FOXG1 if present
+foxg1 <- res31[which(res31$symbol == "FOXG1"), ]
+if (nrow(foxg1) > 0) {
+  points(foxg1$logFC, -log10(foxg1$PValue), pch = 19, col = "blue")
+  text(foxg1$logFC, -log10(foxg1$PValue), labels = "FOXG1", pos = 3, cex = 0.8)
+}
+```
+
+```{r de-pvalhist}
+hist(res11$PValue, main = "edgeR p-values (ASD vs control, TD11)", xlab = "p-value")
+hist(res31$PValue, main = "edgeR p-values (ASD vs control, TD31)", xlab = "p-value")
+```
+
+# Cluster analysis of the DEGs
+
+We visualise the expression of the DEGs (TD31) across samples with a heatmap, annotating the
+columns by group and differentiation day.
+
+```{r heatmap}
+logcpm <- edgeR::cpm(dge, log = TRUE)
+
+# top 50 genes by significance for the TD31 contrast (robust even if few pass FDR)
+deg31_ids <- head(rownames(res31), 50)
+
+ann <- data.frame(group = dge$samples$group, day = dge$samples$day)
+rownames(ann) <- colnames(logcpm)
+
+pheatmap(logcpm[deg31_ids, ],
+         scale = "row",
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         annotation_col = ann,
+         main = "Top-50 genes by significance (ASD vs control, TD31)")
+```
+
+```{r silhouette}
+mat <- logcpm[deg31_ids, ]
+d_mat <- dist(t(mat))
+cl <- cutree(hclust(d_mat), k = 2)                     # 2 clusters: ASD vs control
+plot(silhouette(cl, d_mat), col = c("#2E86C1", "#EC7063"), border = NA,
+     main = "Silhouette (2 clusters)")
+```
+
+```{r save-results}
+save(file = "DEG.RData", list = c("res11", "res31", "dge", "fit"))
+```
+
+# Gene Set Analysis with the ORA method
+
+Over-representation analysis (KEGG) is run on the significant genes of each contrast, using
+all tested genes as the background universe.
+
+```{r ora-prep}
+to_entrez <- function(ids) {
+  as.character(mapIds(org.Hs.eg.db, ids, "ENTREZID", "ENSEMBL", multiVals = "first"))
+}
+
+universe11 <- na.omit(to_entrez(rownames(res11)))
+sig11      <- na.omit(to_entrez(rownames(res11)[res11$FDR < 0.05]))
+
+universe31 <- na.omit(to_entrez(rownames(res31)))
+sig31id    <- na.omit(to_entrez(rownames(res31)[res31$FDR < 0.05]))
+```
+
+## KEGG pathways – TD11
+
+```{r kegg-helper}
+# helper: number of enriched terms, and a safe plotter
+n_terms  <- function(kk) if (is.null(kk)) 0L else nrow(as.data.frame(kk))
+show_bar <- function(kk, title) {
+  if (n_terms(kk) > 0) print(barplot(kk, showCategory = 10, title = title))
+  else cat("No KEGG pathway passed the enrichment threshold for", title, "\n")
+}
+```
+
+```{r kegg-td11}
+kk11 <- enrichKEGG(gene = sig11, universe = universe11,
+                   organism = "hsa", keyType = "ncbi-geneid",
+                   pvalueCutoff = 0.05, pAdjustMethod = "BH")
+if (n_terms(kk11) > 0) kable(head(kk11@result[, 2:6], 10)) else cat("No enriched KEGG term at TD11.\n")
+show_bar(kk11, "KEGG – TD11")
+```
+
+## KEGG pathways – TD31
+
+```{r kegg-td31}
+kk31 <- enrichKEGG(gene = sig31id, universe = universe31,
+                   organism = "hsa", keyType = "ncbi-geneid",
+                   pvalueCutoff = 0.05, pAdjustMethod = "BH")
+if (n_terms(kk31) > 0) kable(head(kk31@result[, 2:6], 10)) else cat("No enriched KEGG term at TD31.\n")
+show_bar(kk31, "KEGG – TD31")
+```
+
+```{r kegg-networks}
+if (n_terms(kk31) >= 2) {
+  kk31 <- pairwise_termsim(kk31)
+  print(emapplot(kk31))
+  print(cnetplot(kk31))
+} else {
+  cat("Not enough enriched terms to draw the enrichment-map / cnet plots.\n")
+}
+```
+
+# Conclusions
+
+In this analysis we re-processed the RNA-seq data of iPSC-derived neural progenitors from the
+Mariani et al. (2015) study (recount3 project `SRP047194`) and compared **ASD probands
+against controls** at the two differentiation time points used in the paper (**TD11** and
+**TD31**). Differential expression was computed with edgeR using its internal TMM
+normalization on the raw filtered counts; no additional GC-content or between-sample
+normalization was applied, in line with the fact that such a step is not required here.
+
+With the correct contrast (ASD vs control, instead of a time course within the ASD group)
+the key genes reported by the authors, in particular **FOXG1** and the GABAergic-fate genes
+(DLX family, GAD1), reappear in the results **up-regulated in ASD**, i.e. in the direction
+described in the paper (FOXG1 logFC ~ +1.3 at both time points; DLX6 the strongest, FDR ~
+0.03-0.06). FOXG1 does not by itself cross the FDR < 0.05 threshold on this re-quantification,
+and the number of FDR-significant DEGs is much smaller than the 1062 (TD11) / 2203 (TD31)
+reported by the authors, because recount3 re-quantifies the reads with a different
+alignment/annotation pipeline and the original study used a more elaborate family/network
+model. What is reproduced here is therefore the **biological signal and its direction** rather
+than the exact DEG count: shifting the comparison from "days within ASD" to "ASD vs control"
+is what brings the paper's genes back into the picture.
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.Rmd text
+*.html binary
+*.xlsx binary
+*.RData binary
