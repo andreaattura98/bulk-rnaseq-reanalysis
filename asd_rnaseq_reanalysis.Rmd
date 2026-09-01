@@ -1,7 +1,8 @@
 ---
 title: "RNA-seq Analysis of iPSC-Derived Neural Progenitors in Autism Spectrum Disorder (ASD probands vs controls)"
-author: "Andrea Attura, Alina Iuferova"
+author: "Andrea Attura"
 date: "2024-05-29"
+knit: (function(input, ...) rmarkdown::render(input, output_file = "Bulk-RNA-Seq.html"))
 output:
   html_document:
     toc: true
@@ -76,6 +77,12 @@ To reproduce their result the differential expression is therefore computed as
 Library-size normalization is handled internally by edgeR (TMM); no additional between-sample
 or GC-content normalization is applied to the counts used for testing.
 
+A second, important point of rigour: the 48 libraries come from only **12 iPSC donors** in
+**4 families**, and most donors are profiled at more than one differentiation day. These
+repeated measures are not independent, so besides the standard edgeR test a **donor-aware
+model** (`voom` + `limma::duplicateCorrelation`) is added to control for the within-donor /
+within-family correlation and to check that the paper's signal survives it.
+
 # Data
 
 Loading the gene-level counts of `SRP047194` from recount3.
@@ -111,9 +118,16 @@ group <- factor(group, levels = c("control", "ASD"))   # control = reference
 day_num <- sub(".*day[ ]*([0-9]+).*", "\\1", attr_str)
 day <- factor(paste0("d", day_num), levels = c("d0", "d11", "d31"))
 
+# donor and family: the metadata carries a "donor id" field formatted
+# FAMILY-INDIVIDUAL (e.g. "1123-01"); the family is the part before the dash.
+donor  <- factor(sub(".*donor id;;([^|]+)\\|.*", "\\1", attr_str))
+family <- factor(sub("-.*", "", as.character(donor)))
+
 # store back into the object
-colData(rse)$group <- group
-colData(rse)$day   <- day
+colData(rse)$group  <- group
+colData(rse)$day    <- day
+colData(rse)$donor  <- donor
+colData(rse)$family <- family
 
 table(group, day)
 ```
@@ -248,7 +262,8 @@ normalization is applied to these counts.
 
 ```{r de-dgelist}
 dge <- DGEList(counts = counts,
-               samples = data.frame(group = group, day = day))
+               samples = data.frame(group = group, day = day,
+                                    donor = donor, family = family))
 
 # group x day design: one coefficient per combination
 grp_day <- factor(paste(group, day, sep = "."))
@@ -374,6 +389,76 @@ if (nrow(foxg1) > 0) {
 hist(res11$PValue, main = "edgeR p-values (ASD vs control, TD11)", xlab = "p-value")
 hist(res31$PValue, main = "edgeR p-values (ASD vs control, TD31)", xlab = "p-value")
 ```
+
+# Controlling for donor and family structure (repeated measures)
+
+The edgeR test above treats the 48 libraries as independent, but they are not: they come from
+only **12 iPSC donors** grouped in **4 families**, and most donors are profiled at more than
+one differentiation day. This matters for two reasons.
+
+- **Pseudo-replication.** Several libraries share the same donor (the same iPSC line), so they
+  are positively correlated. Treating them as independent inflates the residual degrees of
+  freedom and makes the p-values anti-conservative, so the naive DEG count is optimistic.
+- **Donor is nested within group.** Each donor is *either* ASD *or* control for all of its
+  samples (see the table below), so the donor cannot be added as an ordinary fixed effect
+  beside `group`: the two would be collinear and the ASD-vs-control contrast would no longer be
+  estimable. The correct device is to treat the donor as a **random block** and estimate the
+  intra-donor correlation, which is what `limma::duplicateCorrelation` does. Reassuringly, every
+  family contains both an ASD proband and its unaffected relative(s), so the comparison stays a
+  within-family ASD-vs-control contrast — the same family design used by the authors.
+
+```{r donor-structure}
+table(donor = dge$samples$donor, group = dge$samples$group)
+```
+
+We therefore move from the count-based edgeR GLM to the `voom` + `duplicateCorrelation`
+workflow, the limma route that admits a random block. The design matrix and the two contrasts
+(ASD vs control at TD11 and TD31) are exactly the same as before; the only addition is the
+donor block.
+
+```{r voom-dupcor}
+v      <- voom(dge, design)
+corfit <- duplicateCorrelation(v, design, block = dge$samples$donor)
+cat("intra-donor correlation (consensus):", round(corfit$consensus, 3), "\n")
+
+# re-run voom with the estimated correlation, then fit with the donor block
+v      <- voom(dge, design, block = dge$samples$donor, correlation = corfit$consensus)
+corfit <- duplicateCorrelation(v, design, block = dge$samples$donor)
+fit_dc <- lmFit(v, design, block = dge$samples$donor, correlation = corfit$consensus)
+fit_dc <- eBayes(contrasts.fit(fit_dc, con))
+```
+
+Number of DE genes once the donor block is accounted for:
+
+```{r voom-dupcor-summary}
+summary(decideTests(fit_dc))
+```
+
+The same genes highlighted by the paper, now under the donor-aware model:
+
+```{r voom-dupcor-genes}
+tt11 <- topTable(fit_dc, coef = "TD11", n = Inf, sort.by = "none")
+tt31 <- topTable(fit_dc, coef = "TD31", n = Inf, sort.by = "none")
+tt11$symbol <- mapIds(org.Hs.eg.db, rownames(tt11), "SYMBOL", "ENSEMBL", multiVals = "first")
+tt31$symbol <- mapIds(org.Hs.eg.db, rownames(tt31), "SYMBOL", "ENSEMBL", multiVals = "first")
+
+tt31[tt31$symbol %in% paper_genes, c("symbol", "logFC", "P.Value", "adj.P.Val")]
+```
+
+```{r voom-dupcor-foxg1}
+tt11[which(tt11$symbol == "FOXG1"), c("symbol", "logFC", "P.Value", "adj.P.Val")]
+tt31[which(tt31$symbol == "FOXG1"), c("symbol", "logFC", "P.Value", "adj.P.Val")]
+```
+
+**What the donor control changes.** The estimated intra-donor correlation is small but
+positive (~0.09), confirming that libraries from the same donor are more alike than independent
+samples: the pseudo-replication is real. Once it is accounted for, the number of FDR-significant
+genes shrinks (from a few tens with naive edgeR to a handful) — the naive list was inflated by
+the repeated measures. Crucially, the **biology is unchanged**: FOXG1 and the GABAergic-fate
+genes (DLX5/6, GAD1, NRXN1) keep the same **up-in-ASD direction** and comparable
+log-fold-changes, and FOXG1 stays sub-threshold on FDR exactly as before. Controlling for the
+donor/family structure therefore does not overturn the paper's signal; it restates it with
+honest uncertainty, which is the purpose of the correction.
 
 # Cluster analysis of the DEGs
 

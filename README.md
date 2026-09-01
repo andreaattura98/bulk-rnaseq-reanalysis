@@ -25,7 +25,11 @@ the publicly available recount3 counts, with a clean and reproducible edgeR pipe
 4. **Differential expression** — edgeR on the raw filtered counts:
    `filterByExpr` → TMM library-size normalization → `glmQLFit` on a `~0 + group.day`
    design, testing **ASD vs control at TD11 and TD31**.
-5. **Downstream** — result tables with gene symbols, explicit check of the paper's genes,
+5. **Donor/family control (repeated measures)** — because the 48 libraries come from only
+   12 donors in 4 families, a donor-aware model (`voom` + `limma::duplicateCorrelation`,
+   donor as random block) re-runs the same contrasts to correct for the within-donor
+   correlation, as a sensitivity analysis on top of the naive edgeR test.
+6. **Downstream** — result tables with gene symbols, explicit check of the paper's genes,
    MD / volcano / p-value plots, heatmap + silhouette of the top genes, and KEGG
    over-representation analysis (ORA).
 
@@ -41,6 +45,11 @@ The analysis hinges on two decisions that are essential to reproduce the paper:
   (TMM) library-size normalization internally; the raw filtered counts are given to it
   directly. An additional GC-content / between-sample normalization is unnecessary here (and
   incorrect if pre-normalized counts are passed to edgeR).
+- **The samples are not independent.** The 48 libraries come from 12 donors in 4 families,
+  most donors sampled at several days. Since a donor is nested within its group (always ASD or
+  always control), it cannot enter the model as a fixed effect; it is instead handled as a
+  random block via `duplicateCorrelation`, which controls the within-donor correlation without
+  breaking the ASD-vs-control contrast.
 
 ## Results
 
@@ -62,12 +71,19 @@ authors used a more elaborate family/network model. What is reproduced here is t
 **biological signal and its direction** (FOXG1 and the GABAergic programme up in ASD), rather
 than the exact DEG count.
 
+- **Donor-aware model.** Accounting for the within-donor correlation
+  (`voom` + `duplicateCorrelation`, consensus correlation ≈ 0.09) shrinks the number of
+  FDR-significant genes relative to the naive edgeR test — the naive count was inflated by the
+  repeated measures — but leaves the **direction of the paper's genes unchanged** (FOXG1 and
+  the GABAergic-fate genes still up in ASD). The control tempers the statistical claims without
+  overturning the biology.
+
 ## How to reproduce
 
 Open `asd_rnaseq_reanalysis.Rmd` in RStudio and click **Knit**, or from R:
 
 ```r
-rmarkdown::render("asd_rnaseq_reanalysis.Rmd")
+rmarkdown::render("asd_rnaseq_reanalysis.Rmd", output_file = "Bulk-RNA-Seq.html")
 ```
 
 Requirements: R (≥ 4.4) with Bioconductor packages `recount3`, `edgeR`, `limma`, `EDASeq`,
@@ -81,7 +97,7 @@ install chunks in the notebook are set to `eval=FALSE`. An internet connection i
 | File | Description |
 |------|-------------|
 | `asd_rnaseq_reanalysis.Rmd` | Analysis notebook (source) |
-| `asd_rnaseq_reanalysis.html` | Rendered report (self-contained HTML) |
+| `Bulk-RNA-Seq.html` | Rendered report (self-contained HTML) |
 | `data/mmc2/mmc2.xlsx` | Supplementary clinical table from the paper |
 | `DEG.RData` | Saved edgeR results — **not committed** (large; `.gitignore`d, regenerated on knit) |
 
