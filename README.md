@@ -33,7 +33,7 @@ the publicly available recount3 counts, with a clean and reproducible edgeR pipe
    MD / volcano / p-value plots, heatmap + silhouette of the top genes, and KEGG
    over-representation analysis (ORA).
 
-## Two key methodological points
+## Three key methodological points
 
 The analysis hinges on two decisions that are essential to reproduce the paper:
 
